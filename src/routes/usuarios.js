@@ -27,6 +27,10 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ message: 'Contraseña incorrecta' });
     }
 
+    if (user.estado === 'Baneado') {
+      return res.status(403).json({ message: 'Tu cuenta ha sido suspendida. Contacta al administrador.' });
+    }
+
     const token = jwt.sign(
       { id: user.id_usuario, correo: user.correo, rol: user.roles },
       JWT_SECRET,
