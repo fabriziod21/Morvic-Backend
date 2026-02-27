@@ -1,7 +1,10 @@
 const { Router } = require('express');
 const pool = require('../config/db');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 
 const router = Router();
+const JWT_SECRET = process.env.JWT_SECRET || 'morvic_secret_key_2026';
 
 // POST /api/usuarios/login
 router.post('/login', async (req, res) => {
@@ -11,13 +14,25 @@ router.post('/login', async (req, res) => {
       `SELECT u.*, r.id_rol, r.roles
        FROM usuario u
        LEFT JOIN rol r ON u.id_rol = r.id_rol
-       WHERE u.correo = ? AND u.contrasena = ?`,
-      [correo, contrasena]
+       WHERE u.correo = ?`,
+      [correo]
     );
     if (rows.length === 0) {
       return res.status(404).json({ message: 'Usuario no encontrado' });
     }
     const user = rows[0];
+
+    const validPassword = await bcrypt.compare(contrasena, user.contrasena);
+    if (!validPassword) {
+      return res.status(401).json({ message: 'Contraseña incorrecta' });
+    }
+
+    const token = jwt.sign(
+      { id: user.id_usuario, correo: user.correo, rol: user.roles },
+      JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+
     res.json({
       idUsuario: user.id_usuario,
       nombre: user.nombre,
@@ -25,29 +40,67 @@ router.post('/login', async (req, res) => {
       telefono: user.telefono,
       correo: user.correo,
       login: user.login,
-      contrasena: user.contrasena,
       estado: user.estado,
       direccion: user.direccion,
       rol: { idRol: user.id_rol, roles: user.roles },
+      token,
     });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 });
 
-// POST /api/usuarios  (registro)
+// POST /api/usuarios/registro
+router.post('/registro', async (req, res) => {
+  try {
+    const { nombre, apellido, telefono, correo, direccion, contrasena } = req.body;
+
+    const [existing] = await pool.query('SELECT id_usuario FROM usuario WHERE correo = ?', [correo]);
+    if (existing.length > 0) {
+      return res.status(400).json({ message: 'El correo ya está registrado' });
+    }
+
+    const hashedPassword = await bcrypt.hash(contrasena, 10);
+    const idRol = 1; // cliente por defecto
+
+    const [result] = await pool.query(
+      `INSERT INTO usuario (nombre, apellido, telefono, correo, login, contrasena, estado, direccion, id_rol)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [nombre, apellido, telefono, correo, correo, hashedPassword, 'Activo', direccion, idRol]
+    );
+
+    const token = jwt.sign(
+      { id: result.insertId, correo, rol: 'cliente' },
+      JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+
+    res.json({
+      idUsuario: result.insertId,
+      nombre, apellido, telefono, correo, login: correo,
+      estado: 'Activo', direccion,
+      rol: { idRol, roles: 'cliente' },
+      token,
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// POST /api/usuarios  (registro admin - mantener compatibilidad)
 router.post('/', async (req, res) => {
   try {
     const { nombre, apellido, telefono, correo, login, contrasena, estado, direccion, rol } = req.body;
     const idRol = rol?.idRol || 1;
+    const hashedPassword = await bcrypt.hash(contrasena, 10);
     const [result] = await pool.query(
       `INSERT INTO usuario (nombre, apellido, telefono, correo, login, contrasena, estado, direccion, id_rol)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [nombre, apellido, telefono, correo, login, contrasena, estado || 'Activo', direccion, idRol]
+      [nombre, apellido, telefono, correo, login, hashedPassword, estado || 'Activo', direccion, idRol]
     );
     res.json({
       idUsuario: result.insertId,
-      nombre, apellido, telefono, correo, login, contrasena,
+      nombre, apellido, telefono, correo, login,
       estado: estado || 'Activo', direccion,
       rol: { idRol, roles: idRol === 1 ? 'cliente' : 'vendedor' },
     });
