@@ -114,8 +114,8 @@ router.get('/listar', async (req, res) => {
 router.get('/listarPro', async (req, res) => {
   try {
     const [rows] = await pool.query(
-      `SELECT p.id_producto, p.nombre, p.precio, pr.nombre AS nombre_proveedor,
-              p.stock_actual, p.estado, c.nombre AS nombre_categoria
+      `SELECT p.id_producto, p.nombre, p.descripcion, p.precio, pr.nombre AS nombre_proveedor,
+              p.stock_actual, p.stock_minimo, p.stock_maximo, p.estado, c.nombre AS nombre_categoria
        FROM producto p
        INNER JOIN proveedor pr ON p.id_proveedor = pr.id_proveedor
        INNER JOIN categoria c ON p.id_categoria = c.id_categoria`
@@ -123,15 +123,82 @@ router.get('/listarPro', async (req, res) => {
     const result = rows.map(r => ({
       idProducto: r.id_producto,
       nombre: r.nombre,
+      descripcion: r.descripcion,
       precio: r.precio,
       nombreProveedor: r.nombre_proveedor,
       stockActual: r.stock_actual,
+      stockMinimo: r.stock_minimo,
+      stockMaximo: r.stock_maximo,
       estado: r.estado,
       nombreCategoria: r.nombre_categoria,
     }));
     res.json(result);
   } catch (err) {
     res.status(500).json({ message: err.message });
+  }
+});
+
+// PUT /api/producto/actualizar/:id
+router.put('/actualizar/:id', upload.array('imagenes'), async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const { id } = req.params;
+    const producto = JSON.parse(req.body.producto);
+
+    await conn.query(
+      `UPDATE producto SET nombre = ?, descripcion = ?, precio = ?, estado = ?,
+       stock_minimo = ?, stock_maximo = ?, stock_actual = ?, id_categoria = ?, id_proveedor = ?
+       WHERE id_producto = ?`,
+      [
+        producto.nombre, producto.descripcion, producto.precio,
+        producto.estado || 'Disponible',
+        producto.stockMinimo, producto.stockMaximo, producto.stockActual,
+        producto.categoria?.idCategoria, producto.proveedor?.idProveedor,
+        id,
+      ]
+    );
+
+    // Si se envían nuevas imágenes, eliminar las anteriores y subir las nuevas
+    if (req.files && req.files.length > 0) {
+      await conn.query('DELETE FROM imagen_producto WHERE id_producto = ?', [id]);
+
+      for (const file of req.files) {
+        const url = await subirImagen(file);
+        const [imgResult] = await conn.query('INSERT INTO imagen (url) VALUES (?)', [url]);
+        await conn.query('INSERT INTO imagen_producto (id_imagen, id_producto) VALUES (?, ?)', [imgResult.insertId, id]);
+      }
+    }
+
+    await conn.commit();
+
+    const [rows] = await pool.query(
+      `SELECT p.*, c.nombre AS nombre_categoria, pr.nombre AS nombre_proveedor
+       FROM producto p
+       LEFT JOIN categoria c ON p.id_categoria = c.id_categoria
+       LEFT JOIN proveedor pr ON p.id_proveedor = pr.id_proveedor
+       WHERE p.id_producto = ?`,
+      [id]
+    );
+    const [imgs] = await pool.query(
+      `SELECT i.url FROM imagen_producto ip JOIN imagen i ON ip.id_imagen = i.id_imagen WHERE ip.id_producto = ?`,
+      [id]
+    );
+
+    const p = rows[0];
+    res.json({
+      idProducto: p.id_producto,
+      nombre: p.nombre, descripcion: p.descripcion, precio: p.precio,
+      estado: p.estado, stockMinimo: p.stock_minimo, stockMaximo: p.stock_maximo, stockActual: p.stock_actual,
+      categoria: { idCategoria: p.id_categoria, nombre: p.nombre_categoria },
+      proveedor: { idProveedor: p.id_proveedor, nombre: p.nombre_proveedor },
+      imagenes: imgs.map(img => ({ imagen: { url: img.url } })),
+    });
+  } catch (err) {
+    await conn.rollback();
+    res.status(500).json({ message: err.message });
+  } finally {
+    conn.release();
   }
 });
 

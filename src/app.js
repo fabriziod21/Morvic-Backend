@@ -24,6 +24,7 @@ app.use('/api/categoria', require('./routes/categorias'));
 app.use('/api/proveedor', require('./routes/proveedores'));
 app.use('/api/comentarios', require('./routes/comentarios'));
 app.use('/api/kardex', require('./routes/kardex'));
+app.use('/api/venta', require('./routes/ventas'));
 
 // Ruta raíz
 app.get('/', (req, res) => {

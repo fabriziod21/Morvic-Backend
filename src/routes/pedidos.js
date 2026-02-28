@@ -12,12 +12,17 @@ router.post('/registrar', async (req, res) => {
 
     const { pedido, detallesPedido } = req.body;
 
+    // Calcular subtotal e IGV
+    const subtotal = parseFloat((pedido.total / 1.18).toFixed(2));
+    const igv = parseFloat((pedido.total - subtotal).toFixed(2));
+
     // Guardar pedido
     const [pedidoResult] = await conn.query(
-      `INSERT INTO pedido (fecha, hora, metodo_pago, total, estado, direccion_entrega, fecha_entrega, responsable_recojo1, responsable_recojo2, tipo_entrega, id_usuario)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO pedido (fecha, hora, metodo_pago, total, subtotal, igv, estado, direccion_entrega, fecha_entrega, responsable_recojo1, responsable_recojo2, tipo_entrega, id_usuario)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         pedido.fecha, pedido.hora, pedido.metodoPago, pedido.total,
+        subtotal, igv,
         pedido.estado || 'Pendiente',
         pedido.direccionEntrega || '', pedido.fechaEntrega || '',
         pedido.responsableRecojo1 || '', pedido.responsableRecojo2 || '',
@@ -70,7 +75,7 @@ router.post('/registrar', async (req, res) => {
     const pedidoResponse = {
       idPedido,
       fecha: pedido.fecha, hora: pedido.hora, metodoPago: pedido.metodoPago,
-      total: pedido.total, estado: pedido.estado || 'Pendiente',
+      subtotal, igv, total: pedido.total, estado: pedido.estado || 'Pendiente',
       direccionEntrega: pedido.direccionEntrega, fechaEntrega: pedido.fechaEntrega,
       responsableRecojo1: pedido.responsableRecojo1, responsableRecojo2: pedido.responsableRecojo2,
       tipoEntrega: pedido.tipoEntrega,
@@ -80,7 +85,7 @@ router.post('/registrar', async (req, res) => {
 
     // Enviar email
     if (pedido.usuario?.correo) {
-      const html = buildEmailHtml(pedidoResponse, pedido.usuario);
+      const html = buildEmailHtml({ ...pedidoResponse, subtotal, igv }, pedido.usuario);
       enviarCorreo(pedido.usuario.correo, 'Confirmación de Pedido', html).catch(console.error);
     }
 
@@ -225,6 +230,126 @@ router.get('/listarPeorMes', async (req, res) => {
   }
 });
 
+// PUT /api/pedido/actualizarEstado/:id
+router.put('/actualizarEstado/:id', async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const { estado } = req.body;
+    const idPedido = req.params.id;
+    const estadosValidos = ['Pendiente', 'En Proceso', 'Entregado', 'Cancelado'];
+
+    if (!estadosValidos.includes(estado)) {
+      return res.status(400).json({ message: 'Estado no válido' });
+    }
+
+    // Obtener pedido actual
+    const [pedRows] = await conn.query('SELECT * FROM pedido WHERE id_pedido = ?', [idPedido]);
+    if (pedRows.length === 0) throw new Error('Pedido no encontrado');
+    const pedido = pedRows[0];
+
+    // No permitir cambiar estado si ya fue Entregado
+    if (pedido.estado === 'Entregado') {
+      throw new Error('No se puede modificar un pedido ya entregado');
+    }
+
+    // No permitir cambiar estado si ya fue Cancelado
+    if (pedido.estado === 'Cancelado') {
+      throw new Error('No se puede modificar un pedido cancelado');
+    }
+
+    // Si se cancela, devolver stock
+    if (estado === 'Cancelado') {
+      const [detalles] = await conn.query('SELECT * FROM detalle_pedido WHERE id_pedido = ?', [idPedido]);
+      for (const det of detalles) {
+        await conn.query('UPDATE producto SET stock_actual = stock_actual + ? WHERE id_producto = ?', [det.cantidad, det.id_producto]);
+
+        // Registrar kardex de devolución
+        const [prodRows] = await conn.query('SELECT stock_actual FROM producto WHERE id_producto = ?', [det.id_producto]);
+        const now = new Date();
+        await conn.query(
+          `INSERT INTO kardex_inventario (fecha_movimiento, hora_movimiento, tipo_movimiento, cantidad, stock_resultante, id, id_producto)
+           VALUES (?, ?, 'Entrada', ?, ?, ?, ?)`,
+          [now.toISOString().split('T')[0], now.toTimeString().split(' ')[0],
+           det.cantidad, prodRows[0].stock_actual, det.id_detalle_pedido, det.id_producto]
+        );
+      }
+    }
+
+    // Si se entrega, crear venta automáticamente
+    if (estado === 'Entregado') {
+      const [detalles] = await conn.query(
+        `SELECT dp.*, p.precio FROM detalle_pedido dp
+         JOIN producto p ON dp.id_producto = p.id_producto
+         WHERE dp.id_pedido = ?`, [idPedido]
+      );
+
+      let subtotalVenta = 0;
+      const detallesVenta = [];
+
+      for (const det of detalles) {
+        const precioUnitario = det.importe / det.cantidad;
+        const importe = det.importe;
+        const igvDet = parseFloat((importe * 0.18).toFixed(2));
+        const importeConIgv = parseFloat((importe + igvDet).toFixed(2));
+        subtotalVenta += importe;
+
+        detallesVenta.push({
+          idProducto: det.id_producto,
+          cantidad: det.cantidad,
+          precioUnitario,
+          importe,
+          igv: igvDet,
+          importeConIgv,
+        });
+      }
+
+      const igvVenta = parseFloat((subtotalVenta * 0.18).toFixed(2));
+      const totalVenta = parseFloat((subtotalVenta + igvVenta).toFixed(2));
+
+      // Generar número de comprobante
+      const [lastComp] = await conn.query("SELECT numero_comprobante FROM venta ORDER BY id_venta DESC LIMIT 1");
+      let numComprobante = 'B001-00001';
+      if (lastComp.length > 0 && lastComp[0].numero_comprobante) {
+        const parts = lastComp[0].numero_comprobante.split('-');
+        const nextNum = (parseInt(parts[1]) + 1).toString().padStart(5, '0');
+        numComprobante = `${parts[0]}-${nextNum}`;
+      }
+
+      const now = new Date();
+      const fechaVenta = now.toISOString().split('T')[0];
+      const horaVenta = now.toTimeString().split(' ')[0];
+
+      const [ventaResult] = await conn.query(
+        `INSERT INTO venta (id_pedido, fecha_venta, hora_venta, subtotal, igv, total, tipo_comprobante, numero_comprobante, estado, id_usuario)
+         VALUES (?, ?, ?, ?, ?, ?, 'Boleta', ?, 'Completada', ?)`,
+        [idPedido, fechaVenta, horaVenta, subtotalVenta, igvVenta, totalVenta, numComprobante, pedido.id_usuario]
+      );
+      const idVenta = ventaResult.insertId;
+
+      for (const det of detallesVenta) {
+        await conn.query(
+          `INSERT INTO detalle_venta (id_venta, id_producto, cantidad, precio_unitario, importe, igv, importe_con_igv)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [idVenta, det.idProducto, det.cantidad, det.precioUnitario, det.importe, det.igv, det.importeConIgv]
+        );
+      }
+    }
+
+    // Actualizar estado
+    await conn.query('UPDATE pedido SET estado = ? WHERE id_pedido = ?', [estado, idPedido]);
+
+    await conn.commit();
+    res.json({ message: `Pedido actualizado a ${estado}`, idPedido: Number(idPedido), estado });
+  } catch (err) {
+    await conn.rollback();
+    res.status(500).json({ message: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
 // GET /api/pedido/obtenerTotalVentas
 router.get('/obtenerTotalVentas', async (req, res) => {
   try {
@@ -237,16 +362,15 @@ router.get('/obtenerTotalVentas', async (req, res) => {
 
 function buildEmailHtml(pedido, usuario) {
   const detalles = pedido.detalles || [];
-  let subtotal = 0;
   let detallesHtml = '';
 
   for (const det of detalles) {
-    subtotal += det.importe;
     detallesHtml += `<tr><td>${det.producto?.nombre || ''}</td><td>${det.cantidad}</td><td>S/ ${det.importe.toFixed(2)}</td></tr>`;
   }
 
-  const igv = subtotal * 0.18;
-  const total = subtotal + igv;
+  const subtotal = pedido.subtotal || 0;
+  const igv = pedido.igv || 0;
+  const total = pedido.total || 0;
 
   return `<!DOCTYPE html>
 <html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
